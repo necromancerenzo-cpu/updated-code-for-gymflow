@@ -1,0 +1,805 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+
+namespace GymFlow
+{
+    public class InvalidSessionDurationException : Exception
+    {
+        public InvalidSessionDurationException(int attemptedValue)
+            : base($"Duration must be between 15 and 180 minutes. Checked value: {attemptedValue}.")
+        {
+        }
+    }
+
+    public abstract class Membership
+    {
+        public string MembershipId { get; set; }
+        public string MemberName { get; set; }
+        public DateTime StartDate { get; set; }
+
+        protected Membership(string membershipId, string memberName, DateTime startDate)
+        {
+            MembershipId = membershipId;
+            MemberName = memberName;
+            StartDate = startDate;
+        }
+
+        public abstract decimal CalculateMonthlyFee();
+        public virtual string GetPerks() => "No extra benefits.";
+
+        protected int MonthsEnrolled()
+        {
+            var now = DateTime.Now;
+            int months = (now.Year - StartDate.Year) * 12 + (now.Month - StartDate.Month);
+            return months < 0 ? 0 : months;
+        }
+
+        public abstract string TypeTag();
+    }
+
+    public class StandardMembership : Membership
+    {
+        public decimal BaseRate { get; set; }
+        public StandardMembership(string membershipId, string memberName, DateTime startDate, decimal baseRate)
+            : base(membershipId, memberName, startDate) { BaseRate = baseRate; }
+
+        public override decimal CalculateMonthlyFee() => BaseRate;
+        public override string GetPerks() => "Standard gym access.";
+        public override string TypeTag() => "Standard";
+    }
+
+    public class PremiumMembership : Membership
+    {
+        public decimal BaseRate { get; set; }
+        public decimal TrainingCreditValue { get; set; }
+        public decimal LoyaltyDiscount { get; set; }
+
+        public PremiumMembership(string membershipId, string memberName, DateTime startDate,
+            decimal baseRate, decimal trainingCreditValue, decimal loyaltyDiscount)
+            : base(membershipId, memberName, startDate)
+        {
+            BaseRate = baseRate;
+            TrainingCreditValue = trainingCreditValue;
+            LoyaltyDiscount = loyaltyDiscount;
+        }
+
+        public override decimal CalculateMonthlyFee()
+        {
+            decimal fee = BaseRate + TrainingCreditValue;
+            if (MonthsEnrolled() >= 6) fee -= LoyaltyDiscount;
+            return fee;
+        }
+
+        public override string GetPerks()
+        {
+            string loyalty = MonthsEnrolled() >= 6 ? " + Loyalty discount active" : "";
+            return $"1 Personal training credit included{loyalty}.";
+        }
+
+        public override string TypeTag() => "Premium";
+    }
+
+    public class StudentMembership : Membership
+    {
+        public decimal BaseRate { get; set; }
+        public string StudentId { get; set; }
+
+        public StudentMembership(string membershipId, string memberName, DateTime startDate, decimal baseRate, string studentId)
+            : base(membershipId, memberName, startDate) { BaseRate = baseRate; StudentId = studentId; }
+
+        private bool HasValidStudentId() => !string.IsNullOrWhiteSpace(StudentId);
+        public override decimal CalculateMonthlyFee() => HasValidStudentId() ? BaseRate * 0.80m : BaseRate;
+        public override string GetPerks() => HasValidStudentId() ? "Student discount applied (20% off)." : "No Student ID added - Standard rate applied.";
+        public override string TypeTag() => "Student";
+    }
+
+    public static class MembershipPricing
+    {
+        public const decimal StandardRate = 1200m;
+        public const decimal PremiumBaseRate = 2000m;
+        public const decimal PremiumTrainingCredit = 500m;
+        public const decimal PremiumLoyaltyDiscount = 300m;
+        public const decimal StudentBaseRate = 1200m;
+        public const decimal StudentDiscountMultiplier = 0.80m;
+    }
+
+    public enum SessionPriority { Low, Normal, High }
+
+    public class Trainer
+    {
+        public string TrainerId { get; set; }
+        public string Name { get; set; }
+        public string Specialization { get; set; }
+        public decimal HourlyRate { get; set; }
+        public int StartYear { get; set; }
+
+        public static readonly (string Name, string Specialty, decimal Rate, int Year)[] SeedRoster = new (string, string, decimal, int)[]
+        {
+            ("Miguel Santos", "Strength Training", 500m, 2023),
+            ("Andrea Reyes", "Yoga", 400m, 2023),
+            ("Carlo Villanueva", "CrossFit", 600m, 2024),
+            ("Bea Fernandez", "Pilates", 450m, 2024),
+            ("Joshua Cruz", "Powerlifting", 550m, 2023),
+            ("Nicole Aquino", "Zumba", 380m, 2025),
+            ("Rafael Torres", "Boxing", 520m, 2023),
+            ("Katherine Dela Cruz", "Nutrition Coaching", 480m, 2024),
+            ("Emmanuel Bautista", "Calisthenics", 460m, 2025),
+            ("Samantha Garcia", "HIIT", 470m, 2024),
+            ("Patrick Mendoza", "Swimming", 500m, 2023),
+            ("Julia Ramos", "Senior Fitness", 400m, 2025),
+            ("Vincent Lopez", "Martial Arts", 550m, 2023),
+            ("Angela Navarro", "Sports Conditioning", 490m, 2024),
+            ("Christian Domingo", "Rehabilitation", 530m, 2023),
+            ("Michelle Ocampo", "Spin / Cycling", 420m, 2025),
+        };
+
+        public Trainer(string trainerId, string name, string specialization, decimal hourlyRate, int startYear)
+        {
+            TrainerId = trainerId;
+            Name = name;
+            Specialization = specialization;
+            HourlyRate = hourlyRate;
+            StartYear = startYear;
+        }
+
+        public override string ToString() => $"[{TrainerId}] {Name} ({Specialization}) - {HourlyRate:C}/hr";
+    }
+
+    public class TrainingSession
+    {
+        private int _durationMinutes;
+        public string SessionId { get; set; }
+        public Member Member { get; set; }
+        public Trainer Trainer { get; set; }
+        public DateTime Date { get; set; }
+        public string Status { get; set; }
+        public SessionPriority Priority { get; set; }
+
+        public int DurationMinutes
+        {
+            get => _durationMinutes;
+            set
+            {
+                if (value < 15 || value > 180) throw new InvalidSessionDurationException(value);
+                _durationMinutes = value;
+            }
+        }
+
+        public TrainingSession(string sessionId, Member member, Trainer trainer, DateTime date, int durationMinutes,
+            string status = "Scheduled", SessionPriority priority = SessionPriority.Normal)
+        {
+            SessionId = sessionId;
+            Member = member;
+            Trainer = trainer;
+            Date = date;
+            DurationMinutes = durationMinutes;
+            Status = status;
+            Priority = priority;
+        }
+
+        public override string ToString() => $"[{SessionId}] {Date:yyyy-MM-dd} | Client: {Member.Name} | Trainer: {Trainer.Name} | {DurationMinutes} mins | [{Priority} Priority] | Status: {Status}";
+    }
+
+    public class Member
+    {
+        public string MemberId { get; set; }
+        public string Name { get; set; }
+        public string Contact { get; set; }
+        public string GenderIdentity { get; set; }
+        public Membership Membership { get; set; }
+        public List<TrainingSession> Sessions { get; set; } = new List<TrainingSession>();
+
+        public Member(string memberId, string name, string contact, string genderIdentity, Membership membership)
+        {
+            MemberId = memberId;
+            Name = name;
+            Contact = contact;
+            GenderIdentity = string.IsNullOrWhiteSpace(genderIdentity) ? "Not Specified" : genderIdentity;
+            Membership = membership;
+        }
+    }
+
+    public class GymTracker
+    {
+        private const string MembersFile = "members.txt";
+        private const string SessionsFile = "sessions.txt";
+        private int _sessionCounter = 0;
+        
+        private Dictionary<int, int> _yearlyTrainerCounters = new Dictionary<int, int>();
+
+        public List<Member> Members { get; } = new List<Member>();
+        public List<Trainer> Trainers { get; } = new List<Trainer>();
+        public List<TrainingSession> Sessions { get; } = new List<TrainingSession>();
+
+        public void AddMember(Member member) => Members.Add(member);
+
+        public Trainer GetOrAddTrainer(string name, string specialization, decimal hourlyRate, int startYear, string existingId = null)
+        {
+            var existing = Trainers.FirstOrDefault(t => t.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (existing != null) return existing;
+
+            string trainerId = existingId;
+            if (string.IsNullOrEmpty(trainerId))
+            {
+                if (!_yearlyTrainerCounters.ContainsKey(startYear))
+                {
+                    _yearlyTrainerCounters[startYear] = 0;
+                }
+                _yearlyTrainerCounters[startYear]++;
+                
+                string shortYear = startYear.ToString().Substring(1); 
+                trainerId = $"{shortYear}-{_yearlyTrainerCounters[startYear]:00}";
+            }
+            else
+            {
+                try
+                {
+                    var parts = trainerId.Split('-');
+                    if (parts.Length == 2 && int.TryParse(parts[1], out int fileCount))
+                    {
+                        if (!_yearlyTrainerCounters.ContainsKey(startYear) || fileCount > _yearlyTrainerCounters[startYear])
+                        {
+                            _yearlyTrainerCounters[startYear] = fileCount;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            var trainer = new Trainer(trainerId, name, specialization, hourlyRate, startYear);
+            Trainers.Add(trainer);
+            return trainer;
+        }
+
+        public void SeedTrainersIfEmpty()
+        {
+            if (Trainers.Count > 0) return;
+            foreach (var (name, specialty, rate, year) in Trainer.SeedRoster)
+                GetOrAddTrainer(name, specialty, rate, year);
+        }
+
+        private string NextSessionId()
+        {
+            _sessionCounter++;
+            return $"S-{_sessionCounter:000000}";
+        }
+
+        public bool TryBookSession(Member member, Trainer trainer, DateTime date, int durationMinutes, SessionPriority priority, out string errorMessage)
+        {
+            errorMessage = null;
+            try
+            {
+                var session = new TrainingSession(NextSessionId(), member, trainer, date, durationMinutes, "Scheduled", priority);
+                member.Sessions.Add(session);
+                Sessions.Add(session);
+                return true;
+            }
+            catch (InvalidSessionDurationException ex)
+            {
+                errorMessage = ex.Message;
+                return false;
+            }
+        }
+
+        public bool TryCancelSession(string sessionId, out string message)
+        {
+            var session = Sessions.FirstOrDefault(s => s.SessionId.Equals(sessionId, StringComparison.OrdinalIgnoreCase));
+            if (session == null)
+            {
+                message = $"No session found with ID '{sessionId}'.";
+                return false;
+            }
+            if (session.Status == "Cancelled")
+            {
+                message = $"Session {session.SessionId} is already cancelled.";
+                return false;
+            }
+            session.Status = "Cancelled";
+            message = $"Session {session.SessionId} for {session.Member.Name} has been cancelled.";
+            return true;
+        }
+
+        public void SaveAll() { SaveMembers(); SaveSessions(); }
+        public void LoadAll() { LoadMembers(); LoadSessions(); }
+
+        private void SaveMembers()
+        {
+            var lines = new List<string>();
+            foreach (var member in Members)
+            {
+                var ms = member.Membership;
+                string typeFields = ms switch
+                {
+                    StandardMembership s => $"{s.BaseRate}",
+                    PremiumMembership p => $"{p.BaseRate}|{p.TrainingCreditValue}|{p.LoyaltyDiscount}",
+                    StudentMembership st => $"{st.BaseRate}|{st.StudentId}",
+                    _ => ""
+                };
+                lines.Add(string.Join("|", member.MemberId, member.Name, member.Contact, member.GenderIdentity, ms.TypeTag(), ms.MembershipId, ms.StartDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), typeFields));
+            }
+            File.WriteAllLines(MembersFile, lines);
+        }
+
+        private void LoadMembers()
+        {
+            if (!File.Exists(MembersFile)) return;
+            foreach (var line in File.ReadAllLines(MembersFile))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    var parts = line.Split('|');
+                    string memberId = parts[0];
+                    string name = parts[1];
+                    string contact = parts[2];
+                    
+                    // Maintain smooth historical load safety layout checks
+                    string gender = parts[3];
+                    int skip = 0;
+                    if (gender == "Standard" || gender == "Premium" || gender == "Student")
+                    {
+                        gender = "Not Specified";
+                        skip = -1;
+                    }
+
+                    string type = parts[4 + skip];
+                    string membershipId = parts[5 + skip];
+                    DateTime startDate = DateTime.ParseExact(parts[6 + skip], "yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+                    Membership membership = type switch
+                    {
+                        "Standard" => new StandardMembership(membershipId, name, startDate, decimal.Parse(parts[7 + skip])),
+                        "Premium" => new PremiumMembership(membershipId, name, startDate, decimal.Parse(parts[7 + skip]), decimal.Parse(parts[8 + skip]), decimal.Parse(parts[9 + skip])),
+                        "Student" => new StudentMembership(membershipId, name, startDate, decimal.Parse(parts[7 + skip]), parts.Length > (8 + skip) ? parts[8 + skip] : ""),
+                        _ => throw new FormatException($"Unknown type '{type}'")
+                    };
+                    Members.Add(new Member(memberId, name, contact, gender, membership));
+                }
+                catch { }
+            }
+        }
+
+        private void SaveSessions()
+        {
+            var lines = Sessions.Select(s => string.Join("|", s.SessionId, s.Member.MemberId, s.Trainer.IdFallback(), s.Trainer.Name, s.Trainer.Specialization, s.Trainer.HourlyRate, s.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), s.DurationMinutes, s.Status, s.Priority, s.Trainer.StartYear));
+            File.WriteAllLines(SessionsFile, lines);
+        }
+
+        private void LoadSessions()
+        {
+            if (!File.Exists(SessionsFile)) return;
+            foreach (var line in File.ReadAllLines(SessionsFile))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    var parts = line.Split('|');
+                    string sessionId = parts[0];
+                    string memberId = parts[1];
+                    
+                    string trainerId = parts[2].Contains("-") ? parts[2] : null;
+                    int offset = trainerId != null ? 0 : -1;
+
+                    string trainerName = parts[3 + offset];
+                    string specialization = parts[4 + offset];
+                    decimal hourlyRate = decimal.Parse(parts[5 + offset]);
+                    DateTime date = DateTime.ParseExact(parts[6 + offset], "yyyy-MM-dd", CultureInfo.InvariantCulture);
+                    int duration = int.Parse(parts[7 + offset]);
+                    string status = parts[8 + offset];
+                    
+                    SessionPriority priority = parts.Length > (9 + offset) 
+                        ? (SessionPriority)Enum.Parse(typeof(SessionPriority), parts[9 + offset]) 
+                        : SessionPriority.Normal;
+
+                    int startYear = parts.Length > (10 + offset)
+                        ? int.Parse(parts[10 + offset])
+                        : 2023;
+
+                    var member = Members.FirstOrDefault(m => m.MemberId == memberId);
+                    if (member == null) continue;
+
+                    var trainer = GetOrAddTrainer(trainerName, specialization, hourlyRate, startYear, trainerId);
+                    var session = new TrainingSession(sessionId, member, trainer, date, duration, status, priority);
+                    member.Sessions.Add(session);
+                    Sessions.Add(session);
+
+                    string digits = new string(sessionId.Where(char.IsDigit).ToArray());
+                    if (int.TryParse(digits, out int numericId) && numericId > _sessionCounter) _sessionCounter = numericId;
+                }
+                catch { }
+            }
+        }
+    }
+
+    public static class TrainerExtensions
+    {
+        public static string IdFallback(this Trainer trainer) => string.IsNullOrEmpty(trainer.TrainerId) ? "023-00" : trainer.TrainerId;
+    }
+
+    public class Program
+    {
+        private static readonly GymTracker Tracker = new GymTracker();
+
+        public static void Main(string[] args)
+        {
+            Console.Title = "GymFlow Business Management System";
+            Tracker.LoadAll();
+            Tracker.SeedTrainersIfEmpty();
+
+            while (true)
+            {
+                Console.Clear();
+                DrawHeader();
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine("  [1] Register New Member          [5] View Billing Reports");
+                Console.WriteLine("  [2] Book Training Session        [6] View Active Trainers");
+                Console.WriteLine("  [3] Cancel Scheduled Session     [7] View Membership Pricing");
+                Console.WriteLine("  [4] View Member Directory        [8] Save and Exit");
+                Console.ResetColor();
+                DrawDivider();
+                Console.Write(" Choose an option: ");
+
+                string input = Console.ReadLine();
+                if (input == "8")
+                {
+                    Tracker.SaveAll();
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("\n[SUCCESS] All changes saved safely. Goodbye!");
+                    Console.ResetColor();
+                    break;
+                }
+
+                ProcessCommand(input);
+            }
+        }
+
+        private static void DrawHeader()
+        {
+            Console.ForegroundColor = ConsoleColor.Magenta;
+            Console.WriteLine("=====================================================================");
+            Console.WriteLine("                       GYMFLOW MANAGEMENT SYSTEM                     ");
+            Console.WriteLine("=====================================================================");
+            Console.ResetColor();
+        }
+
+        private static void DrawDivider()
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine("---------------------------------------------------------------------");
+            Console.ResetColor();
+        }
+
+        private static void PressAnyKey()
+        {
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.DarkYellow;
+            Console.Write("Press any key to go back to the main menu...");
+            Console.ResetColor();
+            Console.ReadKey();
+        }
+
+        private static void ProcessCommand(string choice)
+        {
+            Console.Clear();
+            DrawHeader();
+
+            switch (choice)
+            {
+                case "1":
+                    RunAddMember();
+                    break;
+                case "2":
+                    RunBookSession();
+                    break;
+                case "3":
+                    RunCancelSession();
+                    break;
+                case "4":
+                    RunViewRecords();
+                    break;
+                case "5":
+                    RunViewBilling();
+                    break;
+                case "6":
+                    RunViewTrainers();
+                    break;
+                case "7":
+                    RunViewPricingGrid();
+                    break;
+                default:
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Invalid selection. Please type a number between 1 and 8.");
+                    Console.ResetColor();
+                    PressAnyKey();
+                    break;
+            }
+        }
+
+        private static void RunAddMember()
+        {
+            Console.WriteLine(">>> MEMBER REGISTRATION\n");
+            Console.Write("Enter Member ID: ");
+            string memberId = Console.ReadLine();
+            Console.Write("Enter Full Name: ");
+            string name = Console.ReadLine();
+            Console.Write("Enter Contact Number: ");
+            string contact = Console.ReadLine();
+            Console.Write("Enter Gender Identity (or leave blank): ");
+            string genderIdentity = Console.ReadLine();
+
+            if (string.IsNullOrWhiteSpace(memberId) || string.IsNullOrWhiteSpace(name))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("\n[FAILED] Member ID and Name fields cannot be left empty.");
+                Console.ResetColor();
+                PressAnyKey();
+                return;
+            }
+
+            Console.WriteLine("\nSelect Membership Plan:");
+            Console.WriteLine(" [1] Standard Plan");
+            Console.WriteLine(" [2] Premium Plan");
+            Console.WriteLine(" [3] Student Plan");
+            Console.Write("Choice: ");
+            string tierChoice = Console.ReadLine();
+
+            string membershipId = "M-" + Guid.NewGuid().ToString("N").Substring(0, 6);
+            DateTime startDate = DateTime.Now;
+            Membership membership;
+
+            if (tierChoice == "2")
+            {
+                membership = new PremiumMembership(membershipId, name, startDate,
+                    MembershipPricing.PremiumBaseRate, MembershipPricing.PremiumTrainingCredit,
+                    MembershipPricing.PremiumLoyaltyDiscount);
+            }
+            else if (tierChoice == "3")
+            {
+                Console.Write("Enter Student ID Card Number: ");
+                string studentId = Console.ReadLine();
+                membership = new StudentMembership(membershipId, name, startDate, MembershipPricing.StudentBaseRate, studentId);
+            }
+            else
+            {
+                membership = new StandardMembership(membershipId, name, startDate, MembershipPricing.StandardRate);
+            }
+
+            Tracker.AddMember(new Member(memberId, name, contact, genderIdentity, membership));
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"\n[SUCCESS] Successfully registered {name} into the system.");
+            Console.ResetColor();
+            PressAnyKey();
+        }
+
+        private static void RunBookSession()
+        {
+            Console.WriteLine(">>> BOOK TRAINING SESSION\n");
+            if (!Tracker.Members.Any())
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[FAILED] No registered members found. Please add a member first.");
+                Console.ResetColor();
+                PressAnyKey();
+                return;
+            }
+
+            Console.WriteLine("Select Member:");
+            for (int i = 0; i < Tracker.Members.Count; i++)
+            {
+                Console.WriteLine($" [{i}] ID: {Tracker.Members[i].MemberId} - {Tracker.Members[i].Name}");
+            }
+            Console.Write("Enter member row number: ");
+            if (!int.TryParse(Console.ReadLine(), out int memIdx) || memIdx < 0 || memIdx >= Tracker.Members.Count)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[ERROR] Invalid selection number.");
+                Console.ResetColor();
+                PressAnyKey();
+                return;
+            }
+
+            Console.WriteLine("\nSelect Trainer:");
+            for (int i = 0; i < Tracker.Trainers.Count; i++)
+            {
+                Console.WriteLine($" [{i}] ID: {Tracker.Trainers[i].TrainerId} | {Tracker.Trainers[i].Name} ({Tracker.Trainers[i].Specialization})");
+            }
+            Console.Write("Enter trainer row number: ");
+            if (!int.TryParse(Console.ReadLine(), out int trnIdx) || trnIdx < 0 || trnIdx >= Tracker.Trainers.Count)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[ERROR] Invalid selection number.");
+                Console.ResetColor();
+                PressAnyKey();
+                return;
+            }
+
+            Console.Write("\nEnter Date (yyyy-MM-dd, or leave blank for today): ");
+            string dateStr = Console.ReadLine();
+            DateTime sessionDate = string.IsNullOrWhiteSpace(dateStr) ? DateTime.Today : DateTime.Parse(dateStr);
+
+            Console.Write("Enter Duration (in minutes): ");
+            int.TryParse(Console.ReadLine(), out int duration);
+
+            Console.WriteLine("\nSelect Priority Level:");
+            Console.WriteLine(" [0] Low   [1] Normal   [2] High");
+            Console.Write("Choice: ");
+            string priStr = Console.ReadLine();
+            SessionPriority priority = priStr == "0" ? SessionPriority.Low : priStr == "2" ? SessionPriority.High : SessionPriority.Normal;
+
+            var member = Tracker.Members[memIdx];
+            var trainer = Tracker.Trainers[trnIdx];
+
+            if (Tracker.TryBookSession(member, trainer, sessionDate, duration, priority, out string errorMessage))
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n[SUCCESS] Session successfully booked.");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\n[REJECTED] Booking failed: {errorMessage}");
+                Console.ResetColor();
+            }
+            PressAnyKey();
+        }
+
+        private static void RunCancelSession()
+        {
+            Console.WriteLine(">>> CANCEL SCHEDULED SESSION\n");
+
+            var activeSessions = Tracker.Sessions.Where(s => s.Status != "Cancelled").ToList();
+
+            if (!activeSessions.Any())
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("There are currently no active booked sessions to cancel.");
+                Console.ResetColor();
+                PressAnyKey();
+                return;
+            }
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("--- ACTIVE BOOKED SESSION LIST ---");
+            Console.ResetColor();
+            foreach (var s in activeSessions)
+            {
+                Console.WriteLine($" ID: {s.SessionId} | {s.Date:yyyy-MM-dd} | Client: {s.Member.Name} with Trainer: {s.Trainer.Name} ({s.DurationMinutes} mins)");
+            }
+            Console.WriteLine();
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("--- SESSIONS BY PRIORITY LEVEL ---");
+            Console.ResetColor();
+            var groupedSessions = activeSessions.GroupBy(s => s.Priority).OrderByDescending(g => g.Key);
+            foreach (var group in groupedSessions)
+            {
+                Console.ForegroundColor = group.Key == SessionPriority.High ? ConsoleColor.Red :
+                                      group.Key == SessionPriority.Normal ? ConsoleColor.Yellow : ConsoleColor.Gray;
+                Console.WriteLine($" [{group.Key} Priority Group]");
+                Console.ResetColor();
+
+                foreach (var s in group)
+                {
+                    Console.WriteLine($"   * ID: {s.SessionId} -> Client: {s.Member.Name} | Trainer: {s.Trainer.Name}");
+                }
+            }
+            DrawDivider();
+
+            Console.Write("Enter the exact Session ID you wish to cancel (e.g., S-000001): ");
+            string targetId = Console.ReadLine().Trim();
+
+            if (Tracker.TryCancelSession(targetId, out string message))
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n[SUCCESS] {message}");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\n[FAILED] {message}");
+            }
+            Console.ResetColor();
+            PressAnyKey();
+        }
+
+        private static void RunViewRecords()
+        {
+            Console.WriteLine(">>> MEMBER DIRECTORY AND VIEW LOGS\n");
+            Console.WriteLine("Select records to view:");
+            Console.WriteLine(" [1] Member Directory");
+            Console.WriteLine(" [2] Complete Time Schedule Logs");
+            Console.WriteLine(" [3] Schedule Logs Filtered by Priority");
+            Console.Write("Choice: ");
+            string subChoice = Console.ReadLine();
+
+            Console.Clear();
+            DrawHeader();
+
+            if (subChoice == "1")
+            {
+                Console.WriteLine("--- REGISTERED MEMBERS DIRECTORY ---\n");
+                if (!Tracker.Members.Any())
+                {
+                    Console.WriteLine("No member records found.");
+                }
+                else
+                {
+                    int count = 1;
+                    foreach (var m in Tracker.Members)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"=================== MEMBER ACCOUNT #{count} ===================");
+                        Console.ResetColor();
+                        Console.WriteLine($"  Unique Account ID : {m.MemberId}");
+                        Console.WriteLine($"  Client Full Name  : {m.Name}");
+                        Console.WriteLine($"  Gender Identity   : {m.GenderIdentity}");
+                        Console.WriteLine($"  Active Price Plan : {m.Membership.TypeTag()} Plan");
+                        Console.WriteLine($"  Contact Details   : {m.Contact}");
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine($"  Assigned Benefits : {m.Membership.GetPerks()}");
+                        Console.ResetColor();
+                        Console.WriteLine();
+                        count++;
+                    }
+                }
+            }
+            else if (subChoice == "2")
+            {
+                Console.WriteLine("--- MASTER TIME SCHEDULE ---\n");
+                if (!Tracker.Sessions.Any()) Console.WriteLine("No booked sessions found.");
+                foreach (var s in Tracker.Sessions) Console.WriteLine($" {s}");
+            }
+            else if (subChoice == "3")
+            {
+                Console.WriteLine("--- SESSIONS SORTED BY HIGHEST PRIORITY ---\n");
+                var ordered = Tracker.Sessions.OrderByDescending(s => s.Priority).ThenBy(s => s.Date).ToList();
+                if (!ordered.Any()) Console.WriteLine("No booked sessions found.");
+                foreach (var s in ordered) Console.WriteLine($" {s}");
+            }
+            PressAnyKey();
+        }
+
+        private static void RunViewBilling()
+        {
+            Console.WriteLine(">>> MONTHLY BILLING SUMMARY\n");
+            if (!Tracker.Members.Any()) Console.WriteLine("No registered members on record.");
+            foreach (var m in Tracker.Members)
+            {
+                Console.WriteLine($" Client: {m.Name,-18} ({m.Membership.TypeTag()} Plan) -> Monthly Fee: {m.Membership.CalculateMonthlyFee():C}");
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                Console.WriteLine($"   * Note: {m.Membership.GetPerks()}");
+                Console.ResetColor();
+            }
+            PressAnyKey();
+        }
+
+        private static void RunViewTrainers()
+        {
+            Console.WriteLine(">>> REGISTERED FITNESS TRAINERS\n");
+            foreach (var t in Tracker.Trainers)
+            {
+                Console.WriteLine($" ID: {t.TrainerId,-10} | Name: {t.Name,-20} | Specialty: {t.Specialization,-22} | Rate: {t.HourlyRate:C}/hour (Started: {t.StartYear})");
+            }
+            PressAnyKey();
+        }
+
+        private static void RunViewPricingGrid()
+        {
+            Console.WriteLine(">>> MASTER MEMBERSHIP PRICING CATALOG\n");
+            Console.WriteLine($"Standard Plan : {MembershipPricing.StandardRate:C}/month");
+            
+            decimal premiumFull = MembershipPricing.PremiumBaseRate + MembershipPricing.PremiumTrainingCredit;
+            decimal premiumAfterLoyalty = premiumFull - MembershipPricing.PremiumLoyaltyDiscount;
+            Console.WriteLine($"Premium Plan  : {premiumFull:C}/month (Includes {MembershipPricing.PremiumTrainingCredit:C} package credits)");
+            Console.WriteLine($"   -> Loyalty Rate   : {premiumAfterLoyalty:C}/month (Applied automatically starting month 6)");
+
+            decimal studentDiscounted = MembershipPricing.StudentBaseRate * MembershipPricing.StudentDiscountMultiplier;
+            Console.WriteLine($"Student Plan  : {studentDiscounted:C}/month (Requires valid Student ID code entry)");
+            PressAnyKey();
+        }
+    }
+}
